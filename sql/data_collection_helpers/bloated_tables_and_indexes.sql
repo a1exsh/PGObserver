@@ -195,3 +195,40 @@ BEGIN
     EXECUTE 'GRANT EXECUTE ON FUNCTION zz_utils.get_bloated_indexes(boolean, int) TO public';
 END;
 $OUTER$;
+
+/*
+The above bloat estimation queries may be way off if there are
+variable width columns with types that do not have the equality
+operator defined, most prominently the JSON type (but JSONB does
+have the operator =).
+
+In this case there would be no entry in the pg_stats for such
+column, thus it's not being accounted for with the avg_width
+calculation in the bloat queries.
+
+We work around this by creating an operator = for JSON which does
+comparison after casting the arguments to the TEXT type.  The stats
+will be created for the affected columns upon the next analyze run.
+
+For safety we revoke use of the function from applications.
+*/
+DO $OUTER$
+DECLARE
+    l_jsoneq_text text := $SQL$
+      CREATE OR REPLACE FUNCTION zz_utils.jsoneq(a JSON, b JSON)
+      RETURNS BOOL AS $$
+          SELECT a::TEXT = b::TEXT;
+      $$ LANGUAGE SQL SECURITY INVOKER;
+    $SQL$;
+BEGIN
+    EXECUTE l_jsoneq_text;
+    EXECUTE 'ALTER FUNCTION zz_utils.jsoneq(JSON, JSON) OWNER TO postgres';
+    EXECUTE 'REVOKE EXECUTE ON FUNCTION zz_utils.jsoneq(JSON, JSON) FROM public';
+
+    EXECUTE 'DROP OPERATOR CLASS IF EXISTS zz_utils.json_ops USING HASH';
+    EXECUTE 'DROP OPERATOR IF EXISTS zz_utils.= (JSON, JSON)';
+
+    EXECUTE 'CREATE OPERATOR zz_utils.= (PROCEDURE=zz_utils.jsoneq, LEFTARG=JSON, RIGHTARG=JSON, HASHES, MERGES)';
+    EXECUTE 'CREATE OPERATOR CLASS zz_utils.json_ops DEFAULT FOR TYPE JSON USING HASH AS OPERATOR 1 zz_utils.=';
+END;
+$OUTER$;
